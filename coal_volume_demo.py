@@ -196,6 +196,97 @@ class CoalVolumeEstimator:
 
         return pcd
 
+    def align_ground_to_xy_plane(self, pcd):
+        """
+        自动检测地面并旋转点云，使地面对齐到XY平面，Z轴垂直向上
+
+        这是解决pile_aware算法假设问题的关键步骤！
+
+        Args:
+            pcd: 输入点云
+
+        Returns:
+            pcd: 对齐后的点云
+            ground_normal: 地面法向量（对齐前）
+            rotation_matrix: 旋转矩阵
+        """
+        print(f"\n[步骤6] 地面自动对齐...")
+        t0 = time.time()
+
+        points = np.asarray(pcd.points)
+
+        # 1. 选取底部30%的点作为地面候选
+        z_threshold = np.percentile(points[:, 2], 30)
+        ground_candidates_mask = points[:, 2] < z_threshold
+        ground_candidates = points[ground_candidates_mask]
+
+        if len(ground_candidates) < 100:
+            print("  ⚠️ 地面候选点太少，跳过对齐")
+            return pcd, np.array([0, 0, 1]), np.eye(3)
+
+        # 2. 使用RANSAC拟合地面平面
+        ground_pcd = o3d.geometry.PointCloud()
+        ground_pcd.points = o3d.utility.Vector3dVector(ground_candidates)
+
+        plane_model, inliers = ground_pcd.segment_plane(
+            distance_threshold=0.03,
+            ransac_n=3,
+            num_iterations=1000
+        )
+
+        [a, b, c, d] = plane_model
+        ground_normal = np.array([a, b, c])
+        ground_normal = ground_normal / np.linalg.norm(ground_normal)
+
+        print(f"  - 检测到地面法向量: [{ground_normal[0]:.3f}, {ground_normal[1]:.3f}, {ground_normal[2]:.3f}]")
+
+        # 3. 计算旋转矩阵，将地面法向量对齐到Z轴
+        target_normal = np.array([0, 0, 1])
+
+        # 如果法向量指向下方，翻转它
+        if ground_normal[2] < 0:
+            ground_normal = -ground_normal
+            print(f"  - 翻转法向量（指向上方）: [{ground_normal[0]:.3f}, {ground_normal[1]:.3f}, {ground_normal[2]:.3f}]")
+
+        # 计算旋转轴和角度
+        rotation_axis = np.cross(ground_normal, target_normal)
+        rotation_axis_norm = np.linalg.norm(rotation_axis)
+
+        if rotation_axis_norm < 1e-6:
+            # 法向量已经对齐
+            print("  ✓ 地面已经对齐到XY平面，无需旋转")
+            rotation_matrix = np.eye(3)
+        else:
+            rotation_axis = rotation_axis / rotation_axis_norm
+            rotation_angle = np.arccos(np.clip(np.dot(ground_normal, target_normal), -1.0, 1.0))
+
+            print(f"  - 旋转角度: {np.degrees(rotation_angle):.2f}°")
+
+            # 使用Rodrigues公式构建旋转矩阵
+            K = np.array([
+                [0, -rotation_axis[2], rotation_axis[1]],
+                [rotation_axis[2], 0, -rotation_axis[0]],
+                [-rotation_axis[1], rotation_axis[0], 0]
+            ])
+
+            rotation_matrix = np.eye(3) + np.sin(rotation_angle) * K + (1 - np.cos(rotation_angle)) * np.dot(K, K)
+
+        # 4. 应用旋转
+        pcd.rotate(rotation_matrix, center=(0, 0, 0))
+
+        # 5. 平移使最低点接近Z=0
+        points_rotated = np.asarray(pcd.points)
+        z_min = points_rotated[:, 2].min()
+        translation = np.array([0, 0, -z_min])
+        pcd.translate(translation)
+
+        t1 = time.time()
+        print(f"✓ 地面对齐完成 (耗时: {t1-t0:.2f}s)")
+        print(f"  - Z轴现在垂直于地面向上")
+        print(f"  - 地面位于Z≈0平面")
+
+        return pcd, ground_normal, rotation_matrix
+
     def postprocess_pointcloud(self, pcd, outlier_std=3.0, voxel_size=0.01):
         """
         点云后处理
@@ -208,7 +299,7 @@ class CoalVolumeEstimator:
         Returns:
             pcd: 处理后的点云
         """
-        print(f"\n[步骤6] 点云后处理...")
+        print(f"\n[步骤7] 点云后处理...")
         t0 = time.time()
 
         initial_count = len(pcd.points)
@@ -256,7 +347,7 @@ class CoalVolumeEstimator:
             ground_height: 地面高度
             ground_plane: 地面平面参数 [a, b, c, d]（仅RANSAC方法）
         """
-        print(f"\n[步骤7] 煤堆分割...")
+        print(f"\n[步骤8] 煤堆分割...")
         t0 = time.time()
 
         points = np.asarray(pcd.points)
@@ -403,7 +494,7 @@ class CoalVolumeEstimator:
 
     def calculate_volume(self, pcd, ground_height):
         """使用多种方法计算体积并融合"""
-        print(f"\n[步骤8] 体积计算...")
+        print(f"\n[步骤9] 体积计算...")
         t0 = time.time()
 
         # 方法1: Delaunay
@@ -479,19 +570,22 @@ class CoalVolumeEstimator:
             # 2. 提取点云（使用自定义置信度阈值）
             pcd = self.extract_pointcloud(scene, confidence_threshold=confidence_threshold)
 
-            # 3. 点云后处理（使用自定义参数）
+            # 3. 地面自动对齐（关键步骤！使Z轴垂直于地面）
+            pcd, ground_normal, rotation_matrix = self.align_ground_to_xy_plane(pcd)
+
+            # 4. 点云后处理（使用自定义参数）
             pcd = self.postprocess_pointcloud(pcd, outlier_std=outlier_std, voxel_size=voxel_size)
 
-            # 4. 煤堆分割（使用RANSAC确保地面是平面）
+            # 5. 煤堆分割（现在地面已经在XY平面上了）
             coal_pcd, ground_height, ground_plane = self.segment_coal_pile(pcd, use_ransac=use_ransac)
 
-            # 5. 体积计算
+            # 6. 体积计算
             volume_result = self.calculate_volume(coal_pcd, ground_height)
 
-            # 6. 重量估算
+            # 7. 重量估算
             weight = self.estimate_weight(volume_result['volume'], coal_density)
 
-            # 7. 保存结果
+            # 8. 保存结果
             os.makedirs(output_dir, exist_ok=True)
 
             # 保存点云
