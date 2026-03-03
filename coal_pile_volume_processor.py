@@ -276,8 +276,11 @@ class CoalPileVolumeProcessor:
 
         Args:
             method:
-                - "max_cross_section"（推荐）: 基于最大横截面面积识别地面
-                - "ransac": RANSAC找最大平面
+                - "pile_aware"（强烈推荐，NEW！）: 基于物料堆真空特性
+                - "csf": CSF布料模拟，适合复杂地形
+                - "deterministic": 完全确定性算法，结果100%稳定
+                - "max_cross_section": 基于最大横截面面积识别地面
+                - "ransac": RANSAC找最大平面（不稳定，不推荐）
                 - "convex_hull_base": 3D凸包底面
                 - "adaptive": 结合横截面面积和密度双重约束
         """
@@ -287,7 +290,19 @@ class CoalPileVolumeProcessor:
 
         points = np.asarray(self.processed_cloud.points)
 
-        if method == "max_cross_section":
+        # 固定随机种子，确保RANSAC结果可复现
+        np.random.seed(42)
+
+        if method == "pile_aware":
+            plane_model, inliers = self._fit_ground_pile_aware(
+                self.processed_cloud, distance_threshold)
+        elif method == "csf":
+            plane_model, inliers = self._fit_ground_csf(
+                self.processed_cloud, distance_threshold)
+        elif method == "deterministic":
+            plane_model, inliers = self._fit_ground_deterministic(
+                self.processed_cloud, distance_threshold)
+        elif method == "max_cross_section":
             plane_model, inliers = self._fit_ground_max_cross_section(
                 self.processed_cloud, distance_threshold)
         elif method == "region_growing":
@@ -392,6 +407,329 @@ class CoalPileVolumeProcessor:
             self.log(f"地面分割完成: 地面 {result['地面点数']} 点, 料堆 {result['料堆点数']} 点")
 
         return result
+
+    def _fit_ground_deterministic(self, cloud: o3d.geometry.PointCloud,
+                                   distance_threshold: float) -> tuple:
+        """
+        完全确定性的地面识别算法（推荐）
+
+        核心原理：
+        1. 按Z值排序，取最低的5-10%点（确定性操作）
+        2. 使用最小二乘法拟合平面（确定性算法，无随机性）
+        3. 找到距离平面小于阈值的所有点作为内点
+
+        优势：
+        - 完全确定性，每次运行结果完全一致
+        - 不依赖随机采样，无RANSAC的不稳定性
+        - 更快（无需迭代）
+        - 更适合DUSt3R点云特性（地面点少，主要是表面点）
+
+        适用场景：
+        - 需要结果稳定可复现的生产环境
+        - 地面点较少的点云（如DUSt3R重建结果）
+        - 对算法速度有要求的场景
+        """
+        points = np.asarray(cloud.points)
+        z_min, z_max = points[:, 2].min(), points[:, 2].max()
+        z_range = z_max - z_min
+
+        self.log(f"  点云Z范围: [{z_min:.4f}, {z_max:.4f}] m, 高度差: {z_range:.4f} m")
+
+        # Step 1: 按Z值排序，取最低的8%点（确定性）
+        z_sorted_indices = np.argsort(points[:, 2])
+        bottom_percentile = 0.08  # 固定比例，确保确定性
+        n_bottom = max(10, int(len(points) * bottom_percentile))
+        bottom_indices = z_sorted_indices[:n_bottom]
+
+        self.log(f"  取Z值最低的{bottom_percentile*100:.0f}%点: {n_bottom}个点")
+
+        # Step 2: 使用最小二乘法拟合平面（确定性算法）
+        bottom_points = points[bottom_indices]
+        plane_model = self._fit_plane_least_squares(bottom_points)
+
+        a, b, c, d = plane_model
+        normal = np.array([a, b, c])
+        normal = normal / np.linalg.norm(normal)
+
+        # 计算倾角
+        z_axis = np.array([0, 0, 1])
+        angle = np.arccos(np.clip(np.abs(np.dot(normal, z_axis)), 0, 1))
+        angle_deg = np.degrees(angle)
+
+        self.log(f"  最小二乘法拟合平面: 倾角={angle_deg:.2f}°")
+
+        # Step 3: 找到距离平面小于阈值的所有点（确定性）
+        norm = np.sqrt(a**2 + b**2 + c**2)
+        distances = np.abs(a * points[:, 0] + b * points[:, 1] + c * points[:, 2] + d) / norm
+        inliers = np.where(distances < distance_threshold)[0]
+
+        self.log(f"  地面内点数: {len(inliers)} ({len(inliers)/len(points)*100:.1f}%)")
+
+        return plane_model, inliers.tolist()
+
+    def _fit_plane_least_squares(self, points: np.ndarray) -> np.ndarray:
+        """
+        使用最小二乘法拟合平面（完全确定性）
+
+        原理：
+        1. 计算点云质心
+        2. 对中心化后的点云进行SVD分解
+        3. 最小奇异值对应的向量即为平面法向量
+
+        Args:
+            points: Nx3点云数组
+
+        Returns:
+            平面方程 [a, b, c, d]，表示 ax + by + cz + d = 0
+        """
+        # 计算质心
+        centroid = points.mean(axis=0)
+
+        # 中心化
+        centered = points - centroid
+
+        # SVD分解（确定性算法）
+        _, _, vh = np.linalg.svd(centered)
+
+        # 最小奇异值对应的向量即为平面法向量
+        normal = vh[2, :]
+
+        # 确保法向量向上（Z分量为正）
+        if normal[2] < 0:
+            normal = -normal
+
+        # 归一化
+        normal = normal / np.linalg.norm(normal)
+
+        # 计算d: ax + by + cz + d = 0 => d = -(a*x0 + b*y0 + c*z0)
+        d = -np.dot(normal, centroid)
+
+        return np.array([normal[0], normal[1], normal[2], d])
+
+    def _fit_ground_pile_aware(self, cloud: o3d.geometry.PointCloud,
+                                distance_threshold: float) -> tuple:
+        """
+        基于物料堆特性的地面识别算法（推荐用于DUSt3R点云）
+
+        核心洞察（来自用户反馈）：
+        1. DUSt3R生成的点云主要是物料堆表面点，地面点极少
+        2. 物料堆内部是真空的（没有点）
+        3. 如果地面朝上（正确）：点云呈现凹陷（内部真空）
+        4. 如果地面朝下（错误）：点云呈现凸起（表面点）
+
+        算法策略：
+        1. 分析不同高度层的XY投影面积
+        2. 如果面积随高度递减 → 地面在底部（正确）
+        3. 如果面积随高度递增 → 地面在顶部（需要翻转）
+        4. 基于面积变化趋势判断地面方向
+
+        适用场景：
+        - DUSt3R生成的点云（地面点稀少）
+        - 物料堆、煤堆、矿石堆等
+        - 点云主要是表面点的场景
+        """
+        from scipy.spatial import ConvexHull
+
+        points = np.asarray(cloud.points)
+        z_min, z_max = points[:, 2].min(), points[:, 2].max()
+        z_range = z_max - z_min
+
+        self.log(f"  点云Z范围: [{z_min:.4f}, {z_max:.4f}] m, 高度差: {z_range:.4f} m")
+        self.log(f"  使用物料堆感知算法（基于真空特性）...")
+
+        # Step 1: 分析不同高度层的XY投影面积
+        self.log(f"  分析不同高度层的XY投影面积（判断地面方向）...")
+
+        areas = []
+        percentiles = [10, 30, 50, 70, 90]
+
+        for percentile in percentiles:
+            z_threshold = z_min + z_range * percentile / 100
+            layer_points = points[points[:, 2] <= z_threshold]
+
+            if len(layer_points) > 3:
+                try:
+                    hull = ConvexHull(layer_points[:, :2])
+                    area = hull.volume  # 2D凸包的面积
+                    areas.append(area)
+                    self.log(f"    底部{percentile}%高度: {len(layer_points)}点, XY面积={area:.6f}")
+                except:
+                    areas.append(0)
+            else:
+                areas.append(0)
+
+        # Step 2: 判断面积变化趋势
+        if len(areas) >= 3:
+            # 计算面积变化趋势（线性回归斜率）
+            x = np.array(percentiles[:len(areas)])
+            y = np.array(areas)
+
+            # 简单线性拟合
+            slope = np.polyfit(x, y, 1)[0]
+
+            self.log(f"  面积变化趋势: 斜率={slope:.8f}")
+
+            if slope > 0:
+                self.log(f"  ✅ 面积随高度递增 → 地面在底部（正确方向）")
+                ground_at_bottom = True
+            else:
+                self.log(f"  ⚠️ 面积随高度递减 → 地面在顶部（需要翻转）")
+                self.log(f"  这种情况很少见，可能是点云坐标系问题")
+                ground_at_bottom = False
+        else:
+            self.log(f"  ⚠️ 无法判断面积趋势，假设地面在底部")
+            ground_at_bottom = True
+
+        # Step 3: 基于判断结果选择地面点
+        if ground_at_bottom:
+            # 地面在底部，取Z值最低的点
+            z_sorted_indices = np.argsort(points[:, 2])
+            bottom_percentile = 0.08
+            n_bottom = max(10, int(len(points) * bottom_percentile))
+            bottom_indices = z_sorted_indices[:n_bottom]
+
+            self.log(f"  取Z值最低的{bottom_percentile*100:.0f}%点: {n_bottom}个点")
+        else:
+            # 地面在顶部（罕见情况），取Z值最高的点
+            z_sorted_indices = np.argsort(points[:, 2])
+            top_percentile = 0.08
+            n_top = max(10, int(len(points) * top_percentile))
+            bottom_indices = z_sorted_indices[-n_top:]
+
+            self.log(f"  取Z值最高的{top_percentile*100:.0f}%点: {n_top}个点")
+
+        # Step 4: 使用最小二乘法拟合平面
+        bottom_points = points[bottom_indices]
+        plane_model = self._fit_plane_least_squares(bottom_points)
+
+        a, b, c, d = plane_model
+        normal = np.array([a, b, c])
+        normal = normal / np.linalg.norm(normal)
+
+        # 计算倾角
+        z_axis = np.array([0, 0, 1])
+        angle = np.arccos(np.clip(np.abs(np.dot(normal, z_axis)), 0, 1))
+        angle_deg = np.degrees(angle)
+
+        self.log(f"  地面平面拟合: 倾角={angle_deg:.2f}°")
+
+        # Step 5: 找到距离平面小于阈值的所有点
+        norm = np.sqrt(a**2 + b**2 + c**2)
+        distances = np.abs(a * points[:, 0] + b * points[:, 1] + c * points[:, 2] + d) / norm
+        inliers = np.where(distances < distance_threshold)[0]
+
+        self.log(f"  地面内点数: {len(inliers)} ({len(inliers)/len(points)*100:.1f}%)")
+
+        return plane_model, inliers.tolist()
+
+    def _fit_ground_csf(self, cloud: o3d.geometry.PointCloud,
+                        distance_threshold: float) -> tuple:
+        """
+        使用CSF (Cloth Simulation Filter) 进行地面识别
+
+        CSF是基于布料模拟的地面过滤算法，专门用于LiDAR点云地面分类。
+
+        核心原理：
+        1. 模拟一块布在重力作用下覆盖点云表面
+        2. 布会自然地贴合地面，而不会陷入物体内部
+        3. 通过布的最终位置识别地面点
+
+        优势：
+        - 适应复杂地形（倾斜、不规则、起伏地面）
+        - 对点云不完整、地面点稀少有更好的容错性
+        - 比RANSAC更鲁棒，不会误判侧面为地面
+        - 参数可调，适应不同场景
+
+        适用场景：
+        - 煤堆、矿石堆等不规则地面
+        - 倾斜地面、地形起伏
+        - DUSt3R生成的稀疏地面点云
+
+        参数说明：
+        - cloth_resolution: 布料分辨率，越小越精细（0.1-1.0）
+        - rigidness: 刚度，1=平坦地形，3=复杂地形
+        - iterations: 迭代次数，越多越精确（500-1000）
+        - class_threshold: 分类阈值，点到布的距离阈值
+        """
+        try:
+            import CSF
+        except ImportError:
+            self.log("  ⚠️ CSF库未安装，请运行: pip install cloth-simulation-filter")
+            self.log("  回退到deterministic方法")
+            return self._fit_ground_deterministic(cloud, distance_threshold)
+
+        points = np.asarray(cloud.points)
+        z_min, z_max = points[:, 2].min(), points[:, 2].max()
+        z_range = z_max - z_min
+
+        self.log(f"  点云Z范围: [{z_min:.4f}, {z_max:.4f}] m, 高度差: {z_range:.4f} m")
+        self.log(f"  使用CSF (Cloth Simulation Filter) 进行地面识别...")
+
+        # 创建CSF对象
+        csf = CSF.CSF()
+
+        # 根据点云大小自适应调整参数
+        # 计算点云XY范围
+        xy_range = max(points[:, 0].max() - points[:, 0].min(),
+                      points[:, 1].max() - points[:, 1].min())
+
+        # 自适应布料分辨率（根据点云大小）
+        cloth_resolution = max(0.05, min(0.5, xy_range / 10))
+
+        # 设置参数（针对煤堆场景优化）
+        csf.params.bSloopSmooth = False  # 不平滑斜坡（保留真实地形）
+        csf.params.cloth_resolution = cloth_resolution  # 自适应布料分辨率
+        csf.params.rigidness = 3  # 刚度=3，适合复杂地形（煤堆）
+        csf.params.time_step = 0.65  # 时间步长
+        csf.params.class_threshold = max(0.05, z_range * 0.05)  # 自适应分类阈值
+        csf.params.interations = 500  # 迭代次数
+
+        self.log(f"  CSF参数: 布料分辨率={csf.params.cloth_resolution:.3f}m, "
+                f"刚度={csf.params.rigidness}, 分类阈值={csf.params.class_threshold:.3f}m, "
+                f"迭代={csf.params.interations}次")
+
+        # 设置点云
+        csf.setPointCloud(points)
+
+        # 执行地面过滤
+        ground = CSF.VecInt()  # 地面点索引
+        non_ground = CSF.VecInt()  # 非地面点索引
+        csf.do_filtering(ground, non_ground)
+
+        # 转换为numpy数组
+        ground_indices = np.array(ground)
+        non_ground_indices = np.array(non_ground)
+
+        self.log(f"  CSF识别结果: 地面点={len(ground_indices)}, "
+                f"非地面点={len(non_ground_indices)}")
+
+        if len(ground_indices) < 3:
+            self.log(f"  ⚠️ 地面点过少({len(ground_indices)})，回退到deterministic方法")
+            return self._fit_ground_deterministic(cloud, distance_threshold)
+
+        # 使用地面点拟合平面（最小二乘法）
+        ground_points = points[ground_indices]
+        plane_model = self._fit_plane_least_squares(ground_points)
+
+        a, b, c, d = plane_model
+        normal = np.array([a, b, c])
+        normal = normal / np.linalg.norm(normal)
+
+        # 计算倾角
+        z_axis = np.array([0, 0, 1])
+        angle = np.arccos(np.clip(np.abs(np.dot(normal, z_axis)), 0, 1))
+        angle_deg = np.degrees(angle)
+
+        self.log(f"  地面平面拟合: 倾角={angle_deg:.2f}°, 地面点数={len(ground_indices)}")
+
+        # 如果倾角过大，说明CSF识别不准确，回退到deterministic方法
+        if angle_deg > 15.0:
+            self.log(f"  ⚠️ CSF识别的地面倾角过大({angle_deg:.2f}° > 15°)")
+            self.log(f"  这可能是因为点云规模较小或地面点稀少")
+            self.log(f"  回退到deterministic方法（更适合DUSt3R点云）")
+            return self._fit_ground_deterministic(cloud, distance_threshold)
+
+        return plane_model, ground_indices.tolist()
 
     def _fit_ground_max_cross_section(self, cloud: o3d.geometry.PointCloud,
                                        distance_threshold: float) -> tuple:

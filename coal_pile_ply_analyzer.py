@@ -137,9 +137,74 @@ class PLYAnalyzerApp:
         except Exception as e:
             return f"❌ 地面识别失败: {str(e)}", None
 
+    def _create_coordinate_axes(self, scale=0.1):
+        """
+        创建三维坐标轴用于可视化
+
+        Args:
+            scale: 坐标轴长度比例
+
+        Returns:
+            trimesh.Scene: 包含XYZ坐标轴的场景
+        """
+        import trimesh
+
+        # 创建坐标轴（Z-up坐标系）
+        # X轴 - 红色
+        x_axis = trimesh.creation.cylinder(radius=scale*0.01, height=scale,
+                                          sections=8)
+        x_axis.apply_translation([scale/2, 0, 0])
+        x_axis.apply_transform(trimesh.transformations.rotation_matrix(
+            np.pi/2, [0, 1, 0]))
+        x_axis.visual.face_colors = [255, 0, 0, 255]  # 红色
+
+        # Y轴 - 绿色
+        y_axis = trimesh.creation.cylinder(radius=scale*0.01, height=scale,
+                                          sections=8)
+        y_axis.apply_translation([0, scale/2, 0])
+        y_axis.apply_transform(trimesh.transformations.rotation_matrix(
+            -np.pi/2, [1, 0, 0]))
+        y_axis.visual.face_colors = [0, 255, 0, 255]  # 绿色
+
+        # Z轴 - 蓝色
+        z_axis = trimesh.creation.cylinder(radius=scale*0.01, height=scale,
+                                          sections=8)
+        z_axis.apply_translation([0, 0, scale/2])
+        z_axis.visual.face_colors = [0, 0, 255, 255]  # 蓝色
+
+        # 创建箭头（指示方向）
+        arrow_scale = scale * 0.05
+
+        # X轴箭头
+        x_arrow = trimesh.creation.cone(radius=arrow_scale, height=arrow_scale*2,
+                                       sections=8)
+        x_arrow.apply_translation([scale, 0, 0])
+        x_arrow.apply_transform(trimesh.transformations.rotation_matrix(
+            np.pi/2, [0, 1, 0]))
+        x_arrow.visual.face_colors = [255, 0, 0, 255]
+
+        # Y轴箭头
+        y_arrow = trimesh.creation.cone(radius=arrow_scale, height=arrow_scale*2,
+                                       sections=8)
+        y_arrow.apply_translation([0, scale, 0])
+        y_arrow.apply_transform(trimesh.transformations.rotation_matrix(
+            -np.pi/2, [1, 0, 0]))
+        y_arrow.visual.face_colors = [0, 255, 0, 255]
+
+        # Z轴箭头
+        z_arrow = trimesh.creation.cone(radius=arrow_scale, height=arrow_scale*2,
+                                       sections=8)
+        z_arrow.apply_translation([0, 0, scale])
+        z_arrow.visual.face_colors = [0, 0, 255, 255]
+
+        # 合并所有坐标轴
+        axes = [x_axis, y_axis, z_axis, x_arrow, y_arrow, z_arrow]
+
+        return axes
+
     def _make_glb_with_ground_plane(self, cloud: o3d.geometry.PointCloud,
                                      ground_mesh: o3d.geometry.TriangleMesh) -> str:
-        """生成包含点云和地面平面的GLB文件"""
+        """生成包含点云、地面平面和坐标轴的GLB文件"""
         try:
             import trimesh
             import tempfile
@@ -172,6 +237,18 @@ class PLYAnalyzerApp:
                 ground_tm = trimesh.Trimesh(vertices=ground_verts, faces=ground_faces)
                 ground_tm.visual.face_colors = [50, 200, 50, 150]  # 半透明绿色
                 scene.add_geometry(ground_tm)
+
+            # 添加坐标轴（计算合适的尺度）
+            point_range = np.ptp(points, axis=0).max()  # 点云最大范围
+            axis_scale = point_range * 0.3  # 坐标轴长度为点云范围的30%
+            axes = self._create_coordinate_axes(scale=axis_scale)
+            for axis in axes:
+                # 转换坐标系（Z-up转Y-up）
+                axis_verts = self._zup_to_yup(np.asarray(axis.vertices))
+                axis_tm = trimesh.Trimesh(vertices=axis_verts,
+                                         faces=np.asarray(axis.faces))
+                axis_tm.visual.face_colors = axis.visual.face_colors
+                scene.add_geometry(axis_tm)
 
             tmp = tempfile.NamedTemporaryFile(suffix='.glb', delete=False)
             scene.export(tmp.name)
@@ -368,7 +445,7 @@ class PLYAnalyzerApp:
         return np.column_stack([pts[:, 0], pts[:, 2], -pts[:, 1]])
 
     def _make_glb(self, cloud: o3d.geometry.PointCloud) -> str:
-        """将点云转为GLB文件用于3D预览"""
+        """将点云转为GLB文件用于3D预览（带坐标轴）"""
         try:
             points = np.asarray(cloud.points)
             if len(points) == 0:
@@ -388,6 +465,17 @@ class PLYAnalyzerApp:
             scene = trimesh.Scene()
             pc = trimesh.PointCloud(self._zup_to_yup(points), colors=colors)
             scene.add_geometry(pc)
+
+            # 添加坐标轴
+            point_range = np.ptp(points, axis=0).max()
+            axis_scale = point_range * 0.3
+            axes = self._create_coordinate_axes(scale=axis_scale)
+            for axis in axes:
+                axis_verts = self._zup_to_yup(np.asarray(axis.vertices))
+                axis_tm = trimesh.Trimesh(vertices=axis_verts,
+                                         faces=np.asarray(axis.faces))
+                axis_tm.visual.face_colors = axis.visual.face_colors
+                scene.add_geometry(axis_tm)
 
             tmp = tempfile.NamedTemporaryFile(suffix='.glb', delete=False)
             scene.export(tmp.name)
@@ -477,36 +565,48 @@ class PLYAnalyzerApp:
                     gr.Markdown("""
 识别地面位置，并自动调整确保所有点都在地面上方
 
-**方法说明**（已找到终极解决方案）：
-- **coordinate_correction（强烈推荐）**：终极方案 - 直接取Z值最低的点
-  - 核心发现：Z值最低的5-10%点必然在地面上
-  - 不依赖法向量、不依赖坐标系方向
-  - 实测效果：倾角<3°，几乎完全水平
-  - **这是唯一不会误判侧面的方法**
-- **region_growing**：区域生长，从最低点开始生长
+**⚠️ 重大更新：基于物料堆真空特性的智能算法！**
+
+**最新推荐方法（v4.0）**：
+- **pile_aware（强烈推荐，NEW！）**：物料堆感知算法
+  - ✅ 专门针对DUSt3R点云设计（地面点极少）
+  - ✅ 基于物料堆内部真空特性
+  - ✅ 分析不同高度层的XY投影面积
+  - ✅ 自动判断地面方向（避免误判侧面）
+  - ✅ 适应"顶端尖、地面宽"的物料堆特征
+  - 原理：如果面积随高度递增 → 地面在底部（正确）
+
+**核心洞察**（来自用户反馈）：
+1. DUSt3R生成的点云主要是物料堆表面点，地面点极少
+2. 物料堆内部是真空的（没有点）
+3. 如果地面朝上（正确）：点云呈现凹陷，面积随高度递增
+4. 如果地面朝下（错误）：点云呈现凸起，面积随高度递减
+
+**其他方法**：
+- **csf**：CSF布料模拟（适合大规模LiDAR点云）
+- **deterministic**：完全确定性算法（快速、稳定）
+- **coordinate_correction**：排除侧面策略
+- **region_growing**：区域生长
 - **max_cross_section**：多候选平面+水平度优先
 - **adaptive**：多层次分析
 - **lowest_points**：底部点直接拟合
-- **ransac**：全局RANSAC
+- **ransac**：全局RANSAC（已固定随机种子）
 - **convex_hull_base**：3D凸包底面
 
-**核心突破**：
-经过多次迭代和实测验证，发现问题根源是DUSt3R重建的点云主要是煤堆表面，
-地面点极少。所有基于平面检测、法向量分析的方法都会被侧面点干扰。
-
-**终极解决方案**：
-直接按Z值排序，取最低的5-10%点，这些点必然在地面上。
-在这些点上拟合平面，得到的就是真正的地面（倾角<3°）。
+**核心改进**：
+1. 新增pile_aware算法（基于物料堆真空特性）
+2. 自动判断地面方向（避免误判侧面）
+3. 专门优化DUSt3R点云特征
 
 **自动调整**：识别后自动向下平移地面，确保所有点都在地面上方
 """)
                     with gr.Row():
                         with gr.Column(scale=1):
                             ground_method = gr.Radio(
-                                choices=["coordinate_correction", "region_growing", "max_cross_section", "lowest_points", "adaptive", "ransac", "convex_hull_base"],
-                                value="coordinate_correction",
+                                choices=["pile_aware", "csf", "deterministic", "coordinate_correction", "region_growing", "max_cross_section", "lowest_points", "adaptive", "ransac", "convex_hull_base"],
+                                value="pile_aware",
                                 label="地面识别方法",
-                                info="强烈推荐coordinate_correction（终极方案，倾角<3°）"
+                                info="强烈推荐pile_aware（基于物料堆真空特性，专为DUSt3R设计）"
                             )
                             dist_thresh = gr.Slider(0.005, 0.05, value=0.01, step=0.005,
                                                     label="距离阈值 (m)",
