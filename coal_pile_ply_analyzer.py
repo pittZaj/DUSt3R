@@ -341,23 +341,17 @@ class PLYAnalyzerApp:
             # 计算尺度因子
             scale_info = ""
             if real_length > 0:
-                # 使用投影到地面平面后的边界长宽（这才是真正的地面范围）
-                pointcloud_length = proj['投影边界长度']  # 投影后的长度
-                pointcloud_width = proj['投影边界宽度']   # 投影后的宽度
+                # 使用凸包顶点间的最大距离作为标定基准
+                pointcloud_max_span = proj['最大跨度']  # 凸包顶点间最大距离
 
-                if pointcloud_length <= 0 or pointcloud_width <= 0:
-                    return "❌ 投影边界计算失败，请检查点云数据"
-
-                # 根据点云地面的长宽比例，自动计算真实宽度
-                # 这样可以保证X和Y方向使用相同的缩放因子，避免变形
-                length_width_ratio = pointcloud_length / pointcloud_width
-                real_width = real_length / length_width_ratio
+                if pointcloud_max_span <= 0:
+                    return "❌ 最大跨度计算失败，请检查点云数据"
 
                 # 计算统一的缩放因子
-                self.scale_factor = real_length / pointcloud_length
+                self.scale_factor = real_length / pointcloud_max_span
 
                 self.ground_real_length = real_length
-                self.ground_real_width = real_width
+                # 不再自动计算宽度，因为最大跨度是唯一的
 
                 # 计算真实尺寸
                 real_bbox_length = bbox['尺寸'][0] * self.scale_factor
@@ -366,21 +360,30 @@ class PLYAnalyzerApp:
                 real_pile_height = result['料堆高度'] * self.scale_factor
                 real_area = proj['凸包面积(m²)'] * (self.scale_factor ** 2)
 
+                # 计算AABB投影边界的真实尺寸（用于参考）
+                real_proj_length = proj['投影边界长度'] * self.scale_factor
+                real_proj_width = proj['投影边界宽度'] * self.scale_factor
+
                 scale_info = f"""
 ### 🎯 尺度标定信息
 | 属性 | 点云坐标系 | 真实尺寸 |
 |------|-----------|---------|
-| 地面长度（投影） | {pointcloud_length:.3f} | {real_length:.3f} m（用户输入） |
-| 地面宽度（投影） | {pointcloud_width:.3f} | **{real_width:.3f} m**（自动计算） |
-| 长宽比例 | {length_width_ratio:.3f} | {length_width_ratio:.3f}（保持一致） |
+| **最大跨度**（标定基准） | {pointcloud_max_span:.3f} | {real_length:.3f} m（用户输入） |
+| 端点1坐标 | [{proj['最大跨度端点1'][0]:.3f}, {proj['最大跨度端点1'][1]:.3f}] | - |
+| 端点2坐标 | [{proj['最大跨度端点2'][0]:.3f}, {proj['最大跨度端点2'][1]:.3f}] | - |
 | 缩放因子 | 1.0 | {self.scale_factor:.3f} |
 | 料堆高度 | {result['料堆高度']:.3f} | **{real_pile_height:.3f} m** |
 | 底面面积 | {proj['凸包面积(m²)']:.4f} | **{real_area:.4f} m²** |
 
+**参考：AABB投影边界**（轴对齐，仅供参考）
+| 投影边界长度 | {proj['投影边界长度']:.3f} | {real_proj_length:.3f} m |
+| 投影边界宽度 | {proj['投影边界宽度']:.3f} | {real_proj_width:.3f} m |
+
 ✅ **尺度标定成功！**
-- 地面范围：所有点垂直投影到地面平面后的最外圈边界
-- 宽度已根据投影边界的长宽比例自动计算，避免变形
-- 堆顶高度：点到地面平面的最大垂直距离（已取绝对值）
+- **标定基准**：凸包顶点间最大距离（唯一、不依赖坐标系方向）
+- **最大跨度**：所有点投影到地面后，凸包顶点中距离最远的两个点
+- **堆顶高度**：点到地面平面的最大垂直距离（已取绝对值）
+- **优势**：避免了AABB的方向依赖问题，测量更准确
 """
             else:
                 self.scale_factor = None
@@ -405,8 +408,9 @@ class PLYAnalyzerApp:
 ### 底面投影轮廓（点云坐标系）
 | 属性 | 值 |
 |------|-----|
-| 投影边界长度 | {proj['投影边界长度']:.4f}（所有点垂直投影到地面后的范围） |
-| 投影边界宽度 | {proj['投影边界宽度']:.4f}（所有点垂直投影到地面后的范围） |
+| **最大跨度** | **{proj['最大跨度']:.4f}**（凸包顶点间最大距离，标定基准） |
+| 投影边界长度 | {proj['投影边界长度']:.4f}（AABB，仅供参考） |
+| 投影边界宽度 | {proj['投影边界宽度']:.4f}（AABB，仅供参考） |
 | 凸包面积 | {proj['凸包面积(m²)']:.4f} |
 | 凸包周长 | {proj['凸包周长(m)']:.4f} |
 | 轮廓顶点数 | {proj['轮廓顶点数']} |
@@ -416,9 +420,6 @@ class PLYAnalyzerApp:
         except Exception as e:
             return f"❌ 边界计算失败: {str(e)}"
 
-    # ─────────────────────────────────────────────
-    # Step 7: 体积计算（支持尺度标定）
-    # ─────────────────────────────────────────────
     def calc_volume(self, method, coal_density):
         if self.processor is None or not self.processor.pile_clouds:
             return "请先执行地面分割", None, None
@@ -828,27 +829,34 @@ class PLYAnalyzerApp:
 计算料堆的3D边界框、底面投影轮廓和堆顶位置
 
 ### 🎯 尺度标定（重要！）
-通过输入地面的真实长度，系统自动根据点云地面的长宽比例计算宽度，建立点云坐标系到真实世界的比例关系。
+通过输入**最外层点间最大距离**的真实长度，建立点云坐标系到真实世界的比例关系。
 
 **核心优势**：
-- ✅ 只需输入一个维度（长度），避免用户输入错误
-- ✅ 自动保持长宽比例一致，避免变形
-- ✅ 统一的缩放因子，确保X、Y、Z三个方向等比例缩放
+- ✅ **唯一性**：最大跨度是唯一的，不依赖坐标系方向
+- ✅ **直观性**：用户可以直接测量煤堆最远两点的距离
+- ✅ **准确性**：避免了轴对齐边界框（AABB）的方向依赖问题
+- ✅ **统一缩放**：确保X、Y、Z三个方向等比例缩放
+
+**什么是最大跨度？**
+- 将所有点垂直投影到地面平面
+- 计算投影点的凸包（最外圈轮廓）
+- 在凸包顶点中找到距离最远的两个点
+- 这两点之间的距离就是"最大跨度"
 
 **操作步骤**：
-1. 测量现场地面的实际长度（单位：米）
-2. 输入下方的长度输入框
+1. 在现场测量煤堆最远两点的实际距离（单位：米）
+2. 输入下方的输入框
 3. 点击"计算边界与堆顶"按钮
-4. 系统将自动计算宽度和缩放因子，后续体积计算将使用真实尺寸
+4. 系统将自动计算缩放因子，后续体积计算将使用真实尺寸
 
-**示例**：如果现场地面长度是10米，系统会根据点云地面的长宽比例自动计算宽度（比如8米）
+**示例**：如果现场测量煤堆最远两点距离是12米，输入12即可
 """)
                     with gr.Row():
                         with gr.Column(scale=1):
                             ground_length = gr.Number(
                                 value=0,
-                                label="地面真实长度（米）",
-                                info="输入0表示不进行尺度标定，宽度将自动计算"
+                                label="最大跨度的真实长度（米）",
+                                info="输入0表示不进行尺度标定。最大跨度=凸包顶点间最大距离"
                             )
                             boundary_btn = gr.Button("📐 计算边界与堆顶", variant="primary")
                         with gr.Column(scale=1):

@@ -3854,26 +3854,42 @@ class CoalPileVolumeProcessor:
 
         # 2D投影轮廓（基于投影到地面平面的点）
         from scipy.spatial import ConvexHull
+        from scipy.spatial.distance import pdist, squareform
         try:
             hull_2d = ConvexHull(xy_points)
             hull_area = hull_2d.volume  # 2D凸包面积
             hull_perimeter = hull_2d.area  # 2D凸包周长
             hull_vertices = xy_points[hull_2d.vertices].tolist()
 
-            # 计算投影边界的长宽（最小外接矩形）
-            from scipy.spatial import ConvexHull
+            # 计算凸包顶点
             hull_points = xy_points[hull_2d.vertices]
-            # 计算边界框
+
+            # 计算投影边界的长宽（轴对齐边界框，用于参考）
             min_xy = hull_points.min(axis=0)
             max_xy = hull_points.max(axis=0)
             projected_length = float(max_xy[0] - min_xy[0])
             projected_width = float(max_xy[1] - min_xy[1])
+
+            # 计算凸包顶点间的最大距离（新增）
+            if len(hull_points) >= 2:
+                distances_matrix = squareform(pdist(hull_points))
+                max_span = float(distances_matrix.max())
+                max_dist_indices = np.unravel_index(distances_matrix.argmax(), distances_matrix.shape)
+                span_point1 = hull_points[max_dist_indices[0]].tolist()
+                span_point2 = hull_points[max_dist_indices[1]].tolist()
+            else:
+                max_span = 0.0
+                span_point1 = [0.0, 0.0]
+                span_point2 = [0.0, 0.0]
         except Exception:
             hull_area = 0.0
             hull_perimeter = 0.0
             hull_vertices = []
             projected_length = 0.0
             projected_width = 0.0
+            max_span = 0.0
+            span_point1 = [0.0, 0.0]
+            span_point2 = [0.0, 0.0]
 
         result = {
             "料堆索引": pile_index,
@@ -3894,7 +3910,10 @@ class CoalPileVolumeProcessor:
                 "凸包周长(m)": round(hull_perimeter, 4),
                 "轮廓顶点数": len(hull_vertices),
                 "投影边界长度": projected_length,
-                "投影边界宽度": projected_width
+                "投影边界宽度": projected_width,
+                "最大跨度": max_span,
+                "最大跨度端点1": span_point1,
+                "最大跨度端点2": span_point2
             }
         }
         self.log(f"边界计算完成: 高度={pile_height:.3f}m, 底面积={hull_area:.3f}m²")
