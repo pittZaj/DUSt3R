@@ -352,6 +352,8 @@ class PLYAnalyzerApp:
 
                 self.ground_real_length = real_length
                 # 不再自动计算宽度，因为最大跨度是唯一的
+                # 但为了兼容体积计算报告，设置为None
+                self.ground_real_width = None
 
                 # 计算真实尺寸
                 real_bbox_length = bbox['尺寸'][0] * self.scale_factor
@@ -443,13 +445,13 @@ class PLYAnalyzerApp:
 ### 🎯 尺度标定结果
 | 属性 | 点云坐标系 | 真实尺寸 |
 |------|-----------|---------|
-| 地面尺寸 | {result['边界框']['尺寸'][0]:.3f} × {result['边界框']['尺寸'][1]:.3f} | {self.ground_real_length:.3f}m × {self.ground_real_width:.3f}m |
+| 地面尺寸 | {result['边界框']['尺寸'][0]:.3f} × {result['边界框']['尺寸'][1]:.3f} | {self.ground_real_length:.3f}m（最大跨度） |
 | 缩放因子 | 1.0 | {self.scale_factor:.3f} |
 | 体积 | {volume_pointcloud:.6f} m³ | **{volume_real:.4f} m³** |
 | 重量 | {volume_pointcloud * coal_density / 1000.0:.3f} 吨 | **{weight_real:.3f} 吨** |
 | 料堆高度 | {result['料堆高度']:.3f} m | **{real_pile_height:.3f} m** |
 
-✅ **已使用尺度标定**：地面真实长度 {self.ground_real_length:.2f}m（输入），宽度 {self.ground_real_width:.2f}m（自动计算）
+✅ **已使用尺度标定**：最大跨度真实长度 {self.ground_real_length:.2f}m（用户输入）
 """
                 volume = volume_real
                 weight = weight_real
