@@ -208,7 +208,7 @@ class CoalVolumeEstimator:
         Returns:
             pcd: 处理后的点云
         """
-        print(f"\n[步骤7] 点云后处理...")
+        print(f"\n[步骤6] 点云后处理...")
         t0 = time.time()
 
         initial_count = len(pcd.points)
@@ -784,29 +784,29 @@ def create_gradio_interface(estimator):
                         confidence_threshold = gr.Slider(
                             minimum=0.1,
                             maximum=2.0,
-                            value=0.5,
+                            value=0.3,
                             step=0.1,
                             label="置信度阈值",
-                            info="推荐: 0.5 | 降低可获得更多点，但可能引入噪声"
+                            info="推荐: 0.3 | 降低可获得更多点，但可能引入噪声"
                         )
 
                         outlier_std = gr.Slider(
                             minimum=1.0,
                             maximum=5.0,
-                            value=3.0,
+                            value=4.0,
                             step=0.5,
                             label="离群点过滤强度",
-                            info="推荐: 3.0 | 越大越宽松，保留更多点"
+                            info="推荐: 4.0 | 越大越宽松，保留更多点"
                         )
 
                     with gr.Row():
                         voxel_size = gr.Slider(
                             minimum=0.005,
                             maximum=0.05,
-                            value=0.01,
+                            value=0.005,
                             step=0.005,
                             label="下采样体素大小 (m)",
-                            info="推荐: 0.01 | 越小保留更多细节，但计算更慢"
+                            info="推荐: 0.005 | 越小保留更多细节，但计算更慢"
                         )
 
                         use_ransac = gr.Checkbox(

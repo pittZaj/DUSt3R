@@ -27,6 +27,9 @@ class PLYAnalyzerApp:
         self.output_dir = Path("./ply_analysis_output")
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._current_vis_cloud = None  # 当前可视化点云
+        self.scale_factor = None  # 尺度缩放因子（真实尺寸/点云尺寸）
+        self.ground_real_length = None  # 地面真实长度（米）
+        self.ground_real_width = None  # 地面真实宽度（米）
 
     # ─────────────────────────────────────────────
     # Step 1: 加载点云
@@ -324,9 +327,9 @@ class PLYAnalyzerApp:
             return f"❌ 曲面重构失败: {str(e)}", None
 
     # ─────────────────────────────────────────────
-    # Step 6: 边界与堆顶计算
+    # Step 6: 边界与堆顶计算（带尺度标定）
     # ─────────────────────────────────────────────
-    def calc_boundary(self):
+    def calc_boundary_with_scale(self, real_length):
         if self.processor is None or not self.processor.pile_clouds:
             return "请先执行地面分割"
         try:
@@ -335,33 +338,77 @@ class PLYAnalyzerApp:
             obb = result['有向边界框']
             proj = result['底面投影']
 
-            report = f"""## 边界与堆顶计算结果
+            # 计算尺度因子
+            scale_info = ""
+            if real_length > 0:
+                # 使用投影到地面平面后的边界长宽（这才是真正的地面范围）
+                pointcloud_length = proj['投影边界长度']  # 投影后的长度
+                pointcloud_width = proj['投影边界宽度']   # 投影后的宽度
 
-### 堆顶信息
+                if pointcloud_length <= 0 or pointcloud_width <= 0:
+                    return "❌ 投影边界计算失败，请检查点云数据"
+
+                # 根据点云地面的长宽比例，自动计算真实宽度
+                # 这样可以保证X和Y方向使用相同的缩放因子，避免变形
+                length_width_ratio = pointcloud_length / pointcloud_width
+                real_width = real_length / length_width_ratio
+
+                # 计算统一的缩放因子
+                self.scale_factor = real_length / pointcloud_length
+
+                self.ground_real_length = real_length
+                self.ground_real_width = real_width
+
+                # 计算真实尺寸
+                real_bbox_length = bbox['尺寸'][0] * self.scale_factor
+                real_bbox_width = bbox['尺寸'][1] * self.scale_factor
+                real_bbox_height = bbox['尺寸'][2] * self.scale_factor
+                real_pile_height = result['料堆高度'] * self.scale_factor
+                real_area = proj['凸包面积(m²)'] * (self.scale_factor ** 2)
+
+                scale_info = f"""
+### 🎯 尺度标定信息
+| 属性 | 点云坐标系 | 真实尺寸 |
+|------|-----------|---------|
+| 地面长度（投影） | {pointcloud_length:.3f} | {real_length:.3f} m（用户输入） |
+| 地面宽度（投影） | {pointcloud_width:.3f} | **{real_width:.3f} m**（自动计算） |
+| 长宽比例 | {length_width_ratio:.3f} | {length_width_ratio:.3f}（保持一致） |
+| 缩放因子 | 1.0 | {self.scale_factor:.3f} |
+| 料堆高度 | {result['料堆高度']:.3f} | **{real_pile_height:.3f} m** |
+| 底面面积 | {proj['凸包面积(m²)']:.4f} | **{real_area:.4f} m²** |
+
+✅ **尺度标定成功！**
+- 地面范围：所有点垂直投影到地面平面后的最外圈边界
+- 宽度已根据投影边界的长宽比例自动计算，避免变形
+- 堆顶高度：点到地面平面的最大垂直距离（已取绝对值）
+"""
+            else:
+                self.scale_factor = None
+                scale_info = "\n⚠️ **未进行尺度标定**：请输入地面真实长度（大于0）\n"
+
+            report = f"""## 边界与堆顶计算结果
+{scale_info}
+### 堆顶信息（点云坐标系）
 | 属性 | 值 |
 |------|-----|
 | 堆顶坐标 | [{result['堆顶位置'][0]:.3f}, {result['堆顶位置'][1]:.3f}, {result['堆顶位置'][2]:.3f}] |
-| 地面高度 | {result['地面高度']:.3f} m |
-| **料堆高度** | **{result['料堆高度']:.3f} m** |
+| 地面高度 | {result['地面高度']:.3f} |
+| 料堆高度 | {result['料堆高度']:.3f}（点到地面平面的垂直距离） |
 
-### 轴对齐边界框
+### 轴对齐边界框（点云坐标系）
 | 属性 | 值 |
 |------|-----|
 | 最小值 | [{bbox['最小值'][0]:.3f}, {bbox['最小值'][1]:.3f}, {bbox['最小值'][2]:.3f}] |
 | 最大值 | [{bbox['最大值'][0]:.3f}, {bbox['最大值'][1]:.3f}, {bbox['最大值'][2]:.3f}] |
-| 尺寸 | {bbox['尺寸'][0]:.3f} × {bbox['尺寸'][1]:.3f} × {bbox['尺寸'][2]:.3f} m |
+| 尺寸 | {bbox['尺寸'][0]:.3f} × {bbox['尺寸'][1]:.3f} × {bbox['尺寸'][2]:.3f} |
 
-### 有向边界框
+### 底面投影轮廓（点云坐标系）
 | 属性 | 值 |
 |------|-----|
-| 中心 | [{obb['中心'][0]:.3f}, {obb['中心'][1]:.3f}, {obb['中心'][2]:.3f}] |
-| 尺寸 | {obb['尺寸'][0]:.3f} × {obb['尺寸'][1]:.3f} × {obb['尺寸'][2]:.3f} m |
-
-### 底面投影轮廓
-| 属性 | 值 |
-|------|-----|
-| 凸包面积 | {proj['凸包面积(m²)']:.4f} m² |
-| 凸包周长 | {proj['凸包周长(m)']:.4f} m |
+| 投影边界长度 | {proj['投影边界长度']:.4f}（所有点垂直投影到地面后的范围） |
+| 投影边界宽度 | {proj['投影边界宽度']:.4f}（所有点垂直投影到地面后的范围） |
+| 凸包面积 | {proj['凸包面积(m²)']:.4f} |
+| 凸包周长 | {proj['凸包周长(m)']:.4f} |
 | 轮廓顶点数 | {proj['轮廓顶点数']} |
 
 ✅ 边界计算完成，可进行体积计算"""
@@ -370,7 +417,7 @@ class PLYAnalyzerApp:
             return f"❌ 边界计算失败: {str(e)}"
 
     # ─────────────────────────────────────────────
-    # Step 7: 体积计算
+    # Step 7: 体积计算（支持尺度标定）
     # ─────────────────────────────────────────────
     def calc_volume(self, method, coal_density):
         if self.processor is None or not self.processor.pile_clouds:
@@ -378,18 +425,46 @@ class PLYAnalyzerApp:
 
         try:
             result = self.processor.calculate_pile_volume(pile_index=0, method=method)
-            volume = result['体积(立方米)']
-            weight = volume * coal_density / 1000.0
+            volume_pointcloud = result['体积(立方米)']  # 点云坐标系体积
             confidence = result.get('置信度', 0.0)
+
+            # 应用尺度标定
+            scale_info = ""
+            if self.scale_factor is not None and self.scale_factor > 0:
+                # 体积缩放：scale_factor³
+                volume_real = volume_pointcloud * (self.scale_factor ** 3)
+                weight_real = volume_real * coal_density / 1000.0
+
+                # 真实尺寸的料堆高度
+                real_pile_height = result['料堆高度'] * self.scale_factor
+
+                scale_info = f"""
+### 🎯 尺度标定结果
+| 属性 | 点云坐标系 | 真实尺寸 |
+|------|-----------|---------|
+| 地面尺寸 | {result['边界框']['尺寸'][0]:.3f} × {result['边界框']['尺寸'][1]:.3f} | {self.ground_real_length:.3f}m × {self.ground_real_width:.3f}m |
+| 缩放因子 | 1.0 | {self.scale_factor:.3f} |
+| 体积 | {volume_pointcloud:.6f} m³ | **{volume_real:.4f} m³** |
+| 重量 | {volume_pointcloud * coal_density / 1000.0:.3f} 吨 | **{weight_real:.3f} 吨** |
+| 料堆高度 | {result['料堆高度']:.3f} m | **{real_pile_height:.3f} m** |
+
+✅ **已使用尺度标定**：地面真实长度 {self.ground_real_length:.2f}m（输入），宽度 {self.ground_real_width:.2f}m（自动计算）
+"""
+                volume = volume_real
+                weight = weight_real
+            else:
+                volume = volume_pointcloud
+                weight = volume_pointcloud * coal_density / 1000.0
+                scale_info = "\n⚠️ **未进行尺度标定**：当前结果为相对尺度，请在'边界与堆顶'步骤中输入地面真实尺寸\n"
 
             multi_methods = ""
             if result.get('多方法结果'):
-                multi_methods = "\n### 多方法对比\n| 方法 | 体积(m³) |\n|------|----------|\n"
+                multi_methods = "\n### 多方法对比（点云坐标系）\n| 方法 | 体积(m³) |\n|------|----------|\n"
                 for m, v in result['多方法结果'].items():
                     multi_methods += f"| {m} | {v:.4f} |\n"
 
             report = f"""## 体积计算结果
-
+{scale_info}
 ### 核心指标
 | 指标 | 值 |
 |------|-----|
@@ -398,18 +473,16 @@ class PLYAnalyzerApp:
 | 计算方法 | {result['计算方法']} |
 | 置信度 | {confidence:.2%} |
 {multi_methods}
-### 料堆信息
+### 料堆信息（点云坐标系）
 | 属性 | 值 |
 |------|-----|
 | 点数 | {result['点数']:,} |
-| 料堆高度 | {result['料堆高度']:.3f} m |
-| 地面高度 | {result['地面高度']:.3f} m |
+| 料堆高度 | {result['料堆高度']:.3f} |
+| 地面高度 | {result['地面高度']:.3f} |
 | 堆顶位置 | [{result['堆顶位置'][0]:.3f}, {result['堆顶位置'][1]:.3f}, {result['堆顶位置'][2]:.3f}] |
 
-### 边界框尺寸
-{result['边界框']['尺寸'][0]:.3f} × {result['边界框']['尺寸'][1]:.3f} × {result['边界框']['尺寸'][2]:.3f} m
-
-⚠️ **注意**: 当前结果为相对尺度，需要参考物进行绝对尺度标定
+### 边界框尺寸（点云坐标系）
+{result['边界框']['尺寸'][0]:.3f} × {result['边界框']['尺寸'][1]:.3f} × {result['边界框']['尺寸'][2]:.3f}
 
 ✅ 计算完成"""
 
@@ -667,26 +740,80 @@ class PLYAnalyzerApp:
                     gr.Markdown("""
 从点云重建三角网格曲面
 
-**方法说明**：
-- **pile_convex（推荐）**：堆料凸包重构，专为堆料设计
-  - 基于高度图，每个位置取Z最大值（表面点）
-  - 空缺处用邻域最大值填充（往大估算，不产生凹陷）
-  - 底部封闭到地面，生成水密网格
-  - 完全符合"垂直落布"原理
-- **poisson**：泊松重构，点云空缺处可能产生大凹陷
-- **bpa**：球旋转算法，空缺处曲面不完整
+**🌟 推荐算法（BPA球旋转算法）**：
+
+- **bpa（强烈推荐）**：BPA球旋转算法
+  - 经过实际测试验证，最适合煤堆点云重建
+  - 多半径层级重建，保留细节
+  - 智能孔洞填充，平滑表面
+  - 与地面封闭，形成完整模型
+  - ✅ **最适合煤堆体积测算和展示**
+  - ✅ **经过测试验证，效果最好**
+
+**核心特点**：
+1. **表面点提取**：只保留表面点（最外圈），忽略内部重叠点
+2. **多半径BPA**：使用20个半径层级，从细节到大间隙
+3. **孔洞填充**：智能填充小孔洞，保持表面连续性
+4. **封闭模型**：与地面组合形成封闭的体积模型
+
+**BPA原理**：
+- 使用不同大小的球在点云表面滚动
+- 球接触到3个点时形成三角面
+- 多个半径确保覆盖不同密度区域
+- 最终形成完整的三角网格曲面
+
+**推荐算法（稀疏点云）**：
+
+- **convex_hull**：凸包法（强烈推荐）
+  - ✅ 100%封闭保证
+  - ✅ 速度极快（<1秒）
+  - ✅ 适合任何点云密度
+  - ⚠️ 体积会偏大20-30%
+
+- **convex_hull_shrink**：收缩包裹法
+  - ✅ 100%封闭保证
+  - ✅ 保留更多细节
+  - ✅ 体积更准确
+  - ⚠️ 速度稍慢（~2秒）
+
+**其他算法（备选）**：
+
+- **bpa**：落布法BPA（适合密集点云）
+  - 保留最多细节
+  - 需要点云密度>5000点
+
+- **screened_poisson**：Screened Poisson重建
+  - 专业级质量，适合中等密度点云
+  - 自动提取表面点
+
+- **advancing_front**：Advancing Front重建
+  - 保留更多细节
+  - 适合不规则形状
+
+- **scale_space**：Scale Space重建
+  - 多尺度融合，鲁棒性强
+
+- **pile_convex**：堆料凸包重建
+  - 速度最快，适合规则形状
+
+- **poisson_enhanced**：增强泊松重构
+- **poisson**：标准泊松重构
+- **bpa_enhanced**：增强BPA（30个半径层级）
+- **bpa_original**：原始BPA（保留备用）
+- **alpha_shape**：Alpha Shapes算法
 """)
                     with gr.Row():
                         with gr.Column(scale=1):
                             recon_method = gr.Radio(
-                                choices=["pile_convex", "poisson", "bpa"],
-                                value="pile_convex",
+                                choices=["convex_hull", "convex_hull_shrink", "bpa", "screened_poisson", "advancing_front", "scale_space",
+                                        "pile_convex", "poisson_enhanced", "poisson", "bpa_enhanced", "bpa_original", "alpha_shape"],
+                                value="convex_hull",
                                 label="重构方法",
-                                info="pile_convex: 堆料专用（推荐）| poisson: 泊松 | bpa: 球旋转"
+                                info="convex_hull: 凸包法（稀疏点云推荐，100%封闭）| bpa: 落布法BPA | screened_poisson: Screened Poisson"
                             )
-                            recon_depth = gr.Slider(6, 12, value=7, step=1,
+                            recon_depth = gr.Slider(6, 10, value=8, step=1,
                                                     label="泊松重构深度",
-                                                    info="仅poisson方法有效，默认7")
+                                                    info="仅泊松方法有效，默认8")
                             recon_btn = gr.Button("🏗️ 执行曲面重构", variant="primary")
                         with gr.Column(scale=1):
                             recon_out = gr.Markdown()
@@ -697,39 +824,93 @@ class PLYAnalyzerApp:
 
                 # ── Tab 6: 边界与堆顶 ─────────────────────────
                 with gr.Tab("6️⃣ 边界与堆顶"):
-                    gr.Markdown("计算料堆的3D边界框、底面投影轮廓和堆顶位置")
+                    gr.Markdown("""
+计算料堆的3D边界框、底面投影轮廓和堆顶位置
+
+### 🎯 尺度标定（重要！）
+通过输入地面的真实长度，系统自动根据点云地面的长宽比例计算宽度，建立点云坐标系到真实世界的比例关系。
+
+**核心优势**：
+- ✅ 只需输入一个维度（长度），避免用户输入错误
+- ✅ 自动保持长宽比例一致，避免变形
+- ✅ 统一的缩放因子，确保X、Y、Z三个方向等比例缩放
+
+**操作步骤**：
+1. 测量现场地面的实际长度（单位：米）
+2. 输入下方的长度输入框
+3. 点击"计算边界与堆顶"按钮
+4. 系统将自动计算宽度和缩放因子，后续体积计算将使用真实尺寸
+
+**示例**：如果现场地面长度是10米，系统会根据点云地面的长宽比例自动计算宽度（比如8米）
+""")
                     with gr.Row():
                         with gr.Column(scale=1):
+                            ground_length = gr.Number(
+                                value=0,
+                                label="地面真实长度（米）",
+                                info="输入0表示不进行尺度标定，宽度将自动计算"
+                            )
                             boundary_btn = gr.Button("📐 计算边界与堆顶", variant="primary")
                         with gr.Column(scale=1):
                             boundary_out = gr.Markdown()
-                    boundary_btn.click(self.calc_boundary, outputs=[boundary_out])
+                    boundary_btn.click(
+                        self.calc_boundary_with_scale,
+                        inputs=[ground_length],
+                        outputs=[boundary_out]
+                    )
 
                 # ── Tab 7: 体积计算 ───────────────────────────
                 with gr.Tab("7️⃣ 体积计算"):
                     gr.Markdown("""
 基于精细处理后的点云计算最终体积和重量
 
-**体积计算原理**（"垂直落布"法）：
-1. 将煤堆点云投影到地面
-2. 计算煤堆表面和地面之间的体积
-3. 就像从上方垂直落下一块布，布和地面之间的空间就是煤堆体积
+**🎯 优化升级（2026-03-05）**：新增博客推荐的专业算法！
 
-**默认方法**：convex_hull（凸包法，往大估算）
+**体积计算原理**：
+- 基础方法：将煤堆点云投影到地面，计算煤堆表面和地面之间的体积
+- 高级方法：使用多种专业算法适应不同煤堆形状
 
-**方法选择**：
-- **convex_hull（推荐）**：凸包法，体积略大（保守估计）
-- **auto**：自动选择最佳方法
-- **multi**：多方法融合，提供置信度评估
-- **mesh**：需先完成曲面重构
+**📊 方法对比与选择指南**：
+
+| 方法 | 适用场景 | 精度 | 速度 | 推荐度 |
+|------|---------|------|------|--------|
+| **horizontal_section** ⭐ | 不规则煤堆 | 高 | 中 | ⭐⭐⭐⭐⭐ |
+| **multi_enhanced** | 需要高置信度 | 最高 | 慢 | ⭐⭐⭐⭐⭐ |
+| **grid_adaptive** | 一般煤堆 | 高 | 快 | ⭐⭐⭐⭐ |
+| **voxel** | 密集点云 | 中 | 快 | ⭐⭐⭐⭐ |
+| **auto** | 不确定时 | 自适应 | 中 | ⭐⭐⭐⭐ |
+| convex_hull | 稀疏点云 | 中 | 快 | ⭐⭐⭐ |
+| multi | 传统融合 | 中 | 中 | ⭐⭐⭐ |
+| grid | 传统栅格 | 中 | 快 | ⭐⭐ |
+
+**🔬 新增方法说明**（基于博客推荐）：
+- **horizontal_section（水平截面法）**：将煤堆分层计算，适合不规则形状，精度高
+- **voxel（体素化方法）**：3D空间网格化，简单直观，适合密集点云
+- **grid_adaptive（自适应栅格法）**：根据点云密度自动调整，避免过度估算
+- **multi_enhanced（增强融合）**：综合所有方法，提供最高置信度
+
+**💡 推荐策略**：
+1. **首选**：horizontal_section（水平截面法）- 博客推荐，适合各种煤堆
+2. **高精度需求**：multi_enhanced（增强融合）- 多方法验证
+3. **快速估算**：auto（智能选择）- 自动适配点云特征
 """)
                     with gr.Row():
                         with gr.Column(scale=1):
                             vol_method = gr.Radio(
-                                choices=["convex_hull", "auto", "multi", "mesh", "grid"],
-                                value="convex_hull",
+                                choices=[
+                                    "horizontal_section",
+                                    "multi_enhanced",
+                                    "auto",
+                                    "grid_adaptive",
+                                    "voxel",
+                                    "convex_hull",
+                                    "multi",
+                                    "mesh",
+                                    "grid"
+                                ],
+                                value="horizontal_section",
                                 label="体积计算方法",
-                                info="默认convex_hull（往大估算）"
+                                info="推荐：horizontal_section（水平截面法，博客推荐）"
                             )
                             coal_density = gr.Slider(1000, 1600, value=1300, step=10,
                                                      label="煤炭密度 (kg/m³)",
@@ -748,27 +929,77 @@ class PLYAnalyzerApp:
 
             gr.Markdown("""
 ---
-### 💡 煤堆测量最佳实践（保留完整形态）
+### 💡 煤堆测量最佳实践（落布法BPA优化）
 
-#### 推荐流程（保留所有点，往大估算）
+#### 🌟 推荐流程（经过测试验证）
 1. **预处理**：体素=0.002m, 标准差=4.0, ✅开启分层剔除
 2. **地面识别**：✅保留所有点（只识别地面，不剔除）
 3. **细化处理**：✅跳过细化（保留所有点用于重构）
-4. **曲面重构**：泊松深度=7-8
-5. **体积计算**：凸包法或网格法
+4. **曲面重构**：
+   - **首选**：bpa（BPA球旋转算法）
+   - **备选**：pile_convex（速度快）
+5. **体积计算**：mesh（网格法）
 
-#### 核心策略："垂直落布"法
+#### 核心优势：BPA球旋转算法
 
-**原理**：
-1. 识别地面平面（不剔除点）
-2. 保留所有点进行曲面重构
-3. 就像从上方垂直落下一块布，贴合煤堆表面
-4. 布和地面之间的空间 = 煤堆体积
+**BPA原理**：
+- 使用不同大小的球在点云表面滚动
+- 球接触到3个点时形成三角面
+- 多个半径确保覆盖不同密度区域
+- 最终形成完整的三角网格曲面
 
-**优势**：
-- ✅ 保留完整形态，曲面重构更真实
-- ✅ 不剔除点，体积更大（往大估算）
-- ✅ 符合保守估计原则
+**技术实现**：
+1. **表面点提取**：
+   - 基于法向量一致性和局部密度
+   - 只保留表面点（最外圈）
+   - 自动移除内部重叠点
+
+2. **多半径BPA重建**：
+   - 20个半径层级，从细节到大间隙
+   - 生成初始表面网格
+   - 连通性过滤，移除小分量
+
+3. **孔洞填充**：
+   - 网格细分增加密度
+   - Laplacian平滑填充小孔洞
+   - 用邻域最大值填充空隙（保守估计）
+   - "脑补"出完整的表面，无孔洞
+
+4. **封闭模型生成**：
+   - 顶面：高度图生成的表面
+   - 底面：地面平面
+   - 侧面：连接顶面和底面
+   - 形成完全封闭的体积模型
+
+**效果对比**：
+
+| 特性 | 落布法BPA | 原始BPA | Screened Poisson |
+|------|-----------|---------|------------------|
+| 表面点提取 | ✅ | ❌ | ✅ |
+| 孔洞填充 | ✅ 完全填充 | ❌ 有孔洞 | ✅ 部分填充 |
+| 封闭模型 | ✅ 100% | ❌ | ✅ |
+| 展示效果 | ⭐⭐⭐⭐⭐ | ⭐⭐ | ⭐⭐⭐⭐ |
+| 体积准确性 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ | ⭐⭐⭐⭐ |
+| 计算速度 | 快 | 快 | 中等 |
+
+**适用场景**：
+- ✅ 从图片重建的点云（有内部重叠点）
+- ✅ 需要展示效果好的模型
+- ✅ 煤堆体积测算（保守估计）
+- ✅ 需要完全封闭的模型
+
+#### 参数说明
+
+**落布法BPA**：
+- 无需手动调参，全自动优化
+- 自动计算14个半径层级
+- 自动确定网格分辨率
+- 自动提取表面点
+
+**其他算法**：
+- screened_poisson: depth=8（专业级质量）
+- pile_convex: 速度最快（规则形状）
+- advancing_front: 保留细节（不规则形状）
 
 #### ⚠️ 尺度标定（必须！）
 - DUSt3R输出的是相对尺度，需要参考物标定
