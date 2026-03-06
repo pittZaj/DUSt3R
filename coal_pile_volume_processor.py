@@ -3159,50 +3159,54 @@ class CoalPileVolumeProcessor:
 
     def _reconstruct_alpha_shape(self, cloud: o3d.geometry.PointCloud, alpha: float = None) -> o3d.geometry.TriangleMesh:
         """
-        Alpha Shapes重构：适合不规则形状和稀疏点云
+        Alpha Shapes重构：适合不规则形状和稀疏点云（改进版）
 
-        Alpha Shapes是一种基于Delaunay三角剖分的方法，通过控制alpha参数
-        来调整重构的"紧密度"。相比BPA，它更适合处理不规则形状。
+        改进点：
+        1. 提取外部表面点，去除内部冗余点
+        2. 使用地面识别的地面平面作为底部
+        3. 改进封闭性（填充孔洞而不是替换算法）
 
         Args:
             cloud: 输入点云
             alpha: Alpha参数（自动计算如果为None）
         """
-        self.log("执行Alpha Shapes曲面重构...")
+        self.log("执行Alpha Shapes曲面重构（改进版）...")
         points = np.asarray(cloud.points)
 
-        # 自动确定alpha参数
+        # 阶段1：提取外部表面点（去除内部冗余点）
+        self.log(f"  [阶段1] 提取外部表面点...")
+        surface_cloud = self._extract_surface_points(cloud)
+        surface_points = np.asarray(surface_cloud.points)
+        self.log(f"  表面点提取: {len(points)} → {len(surface_points)} 点")
+
+        # 阶段2：自动确定alpha参数
         if alpha is None:
-            distances = cloud.compute_nearest_neighbor_distance()
+            distances = surface_cloud.compute_nearest_neighbor_distance()
             avg_dist = np.mean(distances)
-            # alpha设为平均距离的2-3倍通常效果较好
             alpha = avg_dist * 2.5
-            self.log(f"  自动计算alpha: {alpha:.6f} (平均距离的2.5倍)")
+            self.log(f"  自动计算alpha: {alpha:.6f}")
         else:
             self.log(f"  使用指定alpha: {alpha:.6f}")
 
-        # 使用Open3D的Alpha Shape功能
+        # 阶段3：Alpha Shape重构
+        self.log(f"  [阶段3] Alpha Shape重构...")
         try:
-            mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(cloud, alpha)
+            mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(surface_cloud, alpha)
             self.log(f"  Alpha Shape网格: {len(mesh.vertices)} 顶点, {len(mesh.triangles)} 三角面")
         except Exception as e:
-            self.log(f"  ⚠️ Alpha Shape失败: {e}")
-            self.log(f"  回退到BPA方法...")
-            return self._reconstruct_bpa_with_base(cloud)
+            self.log(f"  ⚠️ Alpha Shape失败: {e}，回退到BPA")
+            return self._reconstruct_bpa_with_base(surface_cloud)
 
-        # 后处理
+        # 阶段4：清理
         mesh.remove_degenerate_triangles()
         mesh.remove_duplicated_triangles()
         mesh.remove_duplicated_vertices()
         mesh.compute_vertex_normals()
 
-        # 地面封底
-        ground_z = self._get_ground_z(points)
-        self.log(f"  添加地面封底...")
-        mesh = self._add_ground_base_enhanced(mesh, points, ground_z)
-
-        # 轻微平滑
-        mesh = mesh.filter_smooth_laplacian(number_of_iterations=2, lambda_filter=0.3)
+        # 阶段5：使用地面平面封底
+        ground_z = self._get_ground_z(surface_points)
+        self.log(f"  [阶段5] 使用地面平面封底 (ground_z={ground_z:.4f})...")
+        mesh = self._add_ground_base_enhanced(mesh, surface_points, ground_z)
 
         self.log(f"  最终网格: {len(mesh.vertices)} 顶点, {len(mesh.triangles)} 三角面")
         self.log(f"  是否封闭: {mesh.is_watertight()}")
@@ -3211,25 +3215,68 @@ class CoalPileVolumeProcessor:
 
     def _add_ground_base_enhanced(self, mesh: o3d.geometry.TriangleMesh,
                                    points: np.ndarray,
-                                   ground_z: float) -> o3d.geometry.TriangleMesh:
+                                   ground_z: float = None) -> o3d.geometry.TriangleMesh:
         """
-        增强的地面封底：使用所有点云点的投影
+        增强的地面封底：使用地面平面方程投影所有点云点
+
+        核心改进：
+        1. 使用self.ground_plane平面方程投影点（不是简单的ground_z）
+        2. 创建侧壁连接顶面和底面，确保水密
+        3. 使用凸包生成底面
         """
         from scipy.spatial import ConvexHull
 
-        # 将所有点云点投影到地面
-        projected_points = points.copy()
-        projected_points[:, 2] = ground_z
+        # 获取地面平面参数
+        if self.ground_plane is not None:
+            a, b, c, d = self.ground_plane
+            ground_normal = np.array([a, b, c])
+            ground_normal = ground_normal / np.linalg.norm(ground_normal)
+            self.log(f"  使用地面平面方程: {a:.4f}x + {b:.4f}y + {c:.4f}z + {d:.4f} = 0")
+        else:
+            # 回退到简单的水平面
+            if ground_z is None:
+                ground_z = float(np.percentile(points[:, 2], 5))
+            a, b, c, d = 0, 0, 1, -ground_z
+            ground_normal = np.array([0, 0, 1])
+            self.log(f"  使用水平地面: z = {ground_z:.4f}")
 
         try:
+            # 将所有点云点投影到地面平面
+            projected_points = []
+            for pt in points:
+                # 点到平面的有向距离
+                dist = (a * pt[0] + b * pt[1] + c * pt[2] + d) / np.sqrt(a**2 + b**2 + c**2)
+                # 投影点 = 原点 - 距离 * 法向量
+                projected_pt = pt - dist * ground_normal
+                projected_points.append(projected_pt)
+
+            projected_points = np.array(projected_points)
+
+            # 建立2D坐标系（在地面平面上）
+            if abs(ground_normal[2]) < 0.9:
+                v1 = np.cross(ground_normal, [0, 0, 1])
+            else:
+                v1 = np.cross(ground_normal, [1, 0, 0])
+            v1 = v1 / np.linalg.norm(v1)
+            v2 = np.cross(ground_normal, v1)
+            v2 = v2 / np.linalg.norm(v2)
+
+            # 将投影点转换到2D坐标系
+            projected_2d = np.column_stack([
+                np.dot(projected_points, v1),
+                np.dot(projected_points, v2)
+            ])
+
             # 计算2D凸包
-            hull_2d = ConvexHull(projected_points[:, :2])
+            hull_2d = ConvexHull(projected_2d)
             hull_indices = hull_2d.vertices
             hull_pts = projected_points[hull_indices]
 
-            # 计算中心点
+            # 计算中心点（也在地面平面上）
             center = hull_pts.mean(axis=0)
-            center[2] = ground_z
+            # 确保中心点在地面平面上
+            dist = (a * center[0] + b * center[1] + c * center[2] + d) / np.sqrt(a**2 + b**2 + c**2)
+            center = center - dist * ground_normal
 
             # 创建底面网格（扇形三角化）
             n = len(hull_pts)
@@ -3242,13 +3289,81 @@ class CoalPileVolumeProcessor:
             base_mesh.vertices = o3d.utility.Vector3dVector(base_verts)
             base_mesh.triangles = o3d.utility.Vector3iVector(base_tris)
 
-            # 合并网格
-            mesh = mesh + base_mesh
+            # 创建侧壁：连接顶面边界和底面边界
+            mesh_verts = np.asarray(mesh.vertices)
 
-            self.log(f"  地面封底完成: 添加{len(base_tris)}个三角面")
+            # 找到顶面网格的底部边界点（接近地面的点）
+            distances_to_plane = np.abs(
+                (a * mesh_verts[:, 0] + b * mesh_verts[:, 1] + c * mesh_verts[:, 2] + d) /
+                np.sqrt(a**2 + b**2 + c**2)
+            )
+            z_range = mesh_verts[:, 2].max() - mesh_verts[:, 2].min()
+            bottom_threshold = np.percentile(distances_to_plane, 20)  # 底部20%的点
+
+            bottom_mask = distances_to_plane <= bottom_threshold
+            bottom_verts_indices = np.where(bottom_mask)[0]
+
+            if len(bottom_verts_indices) > 0:
+                # 将底部顶点投影到地面平面
+                bottom_verts = mesh_verts[bottom_verts_indices]
+                bottom_projected = []
+                for pt in bottom_verts:
+                    dist = (a * pt[0] + b * pt[1] + c * pt[2] + d) / np.sqrt(a**2 + b**2 + c**2)
+                    projected_pt = pt - dist * ground_normal
+                    bottom_projected.append(projected_pt)
+                bottom_projected = np.array(bottom_projected)
+
+                # 创建侧壁三角形（连接原始底部点和投影点）
+                side_verts = []
+                side_tris = []
+                base_idx = len(mesh_verts)
+
+                for i, orig_idx in enumerate(bottom_verts_indices):
+                    side_verts.append(bottom_projected[i])
+
+                # 按角度排序底部点，形成环
+                center_2d = bottom_projected.mean(axis=0)
+                angles = np.arctan2(
+                    np.dot(bottom_projected - center_2d, v2),
+                    np.dot(bottom_projected - center_2d, v1)
+                )
+                sorted_indices = np.argsort(angles)
+
+                # 创建侧壁三角形
+                for i in range(len(sorted_indices)):
+                    curr_orig = bottom_verts_indices[sorted_indices[i]]
+                    next_orig = bottom_verts_indices[sorted_indices[(i + 1) % len(sorted_indices)]]
+                    curr_proj = base_idx + sorted_indices[i]
+                    next_proj = base_idx + sorted_indices[(i + 1) % len(sorted_indices)]
+
+                    # 两个三角形形成一个四边形侧壁
+                    side_tris.append([curr_orig, next_orig, next_proj])
+                    side_tris.append([curr_orig, next_proj, curr_proj])
+
+                if len(side_tris) > 0:
+                    # 创建侧壁网格
+                    side_mesh = o3d.geometry.TriangleMesh()
+                    all_verts = np.vstack([mesh_verts, np.array(side_verts)])
+                    side_mesh.vertices = o3d.utility.Vector3dVector(all_verts)
+                    side_mesh.triangles = o3d.utility.Vector3iVector(
+                        np.vstack([np.asarray(mesh.triangles), side_tris])
+                    )
+
+                    # 合并所有网格
+                    mesh = side_mesh + base_mesh
+                    self.log(f"  地面封底完成: 底面{len(base_tris)}个三角面, 侧壁{len(side_tris)}个三角面")
+                else:
+                    mesh = mesh + base_mesh
+                    self.log(f"  地面封底完成: 添加{len(base_tris)}个三角面（无侧壁）")
+            else:
+                # 没有找到底部点，直接合并底面
+                mesh = mesh + base_mesh
+                self.log(f"  地面封底完成: 添加{len(base_tris)}个三角面")
 
         except Exception as e:
             self.log(f"  ⚠️ 地面封底失败: {e}")
+            import traceback
+            traceback.print_exc()
 
         return mesh
 
@@ -4738,5 +4853,207 @@ class CoalPileVolumeProcessor:
             self.log(f"  体积: {volume:.6f} m³")
 
         self.log(f"曲面重构完成: {len(mesh.vertices)} 顶点, {len(mesh.triangles)} 三角面, 水密: {mesh.is_watertight()}")
+
+        return mesh
+
+    def _extract_surface_points(self, cloud: o3d.geometry.PointCloud,
+                                radius_multiplier: float = 2.5) -> o3d.geometry.PointCloud:
+        """
+        提取外部表面点，去除内部冗余点
+
+        使用基于法向量和局部密度的方法识别表面点：
+        1. 计算每个点的法向量
+        2. 检查点是否在表面（法向量一致性）
+        3. 去除内部重叠点
+
+        Args:
+            cloud: 输入点云
+            radius_multiplier: 搜索半径倍数
+
+        Returns:
+            表面点云
+        """
+        self.log("  提取外部表面点...")
+        points = np.asarray(cloud.points)
+
+        # 确保有法向量
+        if not cloud.has_normals():
+            cloud.estimate_normals(
+                search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30)
+            )
+            cloud.orient_normals_consistent_tangent_plane(k=15)
+
+        normals = np.asarray(cloud.normals)
+
+        # 计算平均点间距
+        distances = cloud.compute_nearest_neighbor_distance()
+        avg_dist = np.mean(distances)
+        search_radius = avg_dist * radius_multiplier
+
+        # 构建KD树
+        pcd_tree = o3d.geometry.KDTreeFlann(cloud)
+
+        # 标记表面点
+        is_surface = np.zeros(len(points), dtype=bool)
+
+        for i in range(len(points)):
+            # 搜索邻域
+            [k, idx, _] = pcd_tree.search_radius_vector_3d(points[i], search_radius)
+
+            if k < 5:  # 孤立点，保留
+                is_surface[i] = True
+                continue
+
+            # 计算法向量一致性
+            neighbor_normals = normals[idx[1:]]  # 排除自己
+            current_normal = normals[i]
+
+            # 计算与邻居法向量的点积
+            dot_products = np.abs(np.dot(neighbor_normals, current_normal))
+            consistency = np.mean(dot_products)
+
+            # 如果法向量一致性高，说明是表面点
+            # 如果一致性低，说明可能是内部点（周围法向量指向不同方向）
+            if consistency > 0.7:  # 阈值可调
+                is_surface[i] = True
+            else:
+                # 进一步检查：计算点到邻居的方向与法向量的一致性
+                neighbor_points = points[idx[1:]]
+                directions = neighbor_points - points[i]
+                directions = directions / (np.linalg.norm(directions, axis=1, keepdims=True) + 1e-8)
+
+                # 表面点的法向量应该与到邻居的方向大致垂直
+                perpendicularity = np.abs(np.dot(directions, current_normal))
+                avg_perp = np.mean(perpendicularity)
+
+                if avg_perp < 0.5:  # 大致垂直
+                    is_surface[i] = True
+
+        # 创建表面点云
+        surface_indices = np.where(is_surface)[0]
+        surface_cloud = cloud.select_by_index(surface_indices)
+
+        self.log(f"    表面点提取: {len(points)} → {len(surface_indices)} 点 ({len(surface_indices)/len(points)*100:.1f}%)")
+
+        return surface_cloud
+
+    def _repair_mesh_closure(self, mesh: o3d.geometry.TriangleMesh,
+                             points: np.ndarray,
+                             ground_z: float) -> o3d.geometry.TriangleMesh:
+        """
+        修复网格封闭性
+
+        策略：
+        1. 检测边界边
+        2. 填充孔洞
+        3. 确保地面封底
+        4. 修复非流形边
+
+        Args:
+            mesh: 输入网格
+            points: 原始点云
+            ground_z: 地面高度
+
+        Returns:
+            修复后的网格
+        """
+        self.log("  修复网格封闭性...")
+
+        # 1. 检测并填充小孔洞
+        self.log("    填充小孔洞...")
+        initial_triangles = len(mesh.triangles)
+
+        # 使用细分和平滑来填充孔洞
+        if initial_triangles < 10000:
+            mesh = mesh.subdivide_midpoint(number_of_iterations=1)
+            self.log(f"    网格细分: {initial_triangles} → {len(mesh.triangles)} 三角面")
+
+        # Laplacian平滑可以帮助填充小孔洞
+        mesh = mesh.filter_smooth_laplacian(number_of_iterations=3, lambda_filter=0.5)
+
+        # 2. 清理非流形结构
+        self.log("    清理非流形结构...")
+        mesh.remove_degenerate_triangles()
+        mesh.remove_duplicated_triangles()
+        mesh.remove_duplicated_vertices()
+        mesh.remove_non_manifold_edges()
+
+        # 3. 确保地面封底
+        if not mesh.is_watertight():
+            self.log("    重新添加地面封底...")
+            mesh = self._add_ground_base_enhanced(mesh, points, ground_z)
+
+        # 4. 最终检查
+        if mesh.is_watertight():
+            self.log("    ✓ 网格已封闭")
+        else:
+            self.log("    ⚠️ 网格仍未完全封闭，但已尽力修复")
+
+        return mesh
+
+    def _ensure_watertight_mesh(self, mesh: o3d.geometry.TriangleMesh,
+                                cloud: o3d.geometry.PointCloud) -> o3d.geometry.TriangleMesh:
+        """
+        确保网格封闭（修复方法，不替换算法）
+
+        策略：
+        1. 检测并填充孔洞
+        2. 改进地面封底
+        3. 修复非流形边
+        4. 如果仍未封闭，尝试更激进的修复
+
+        Args:
+            mesh: 输入网格
+            cloud: 原始点云
+
+        Returns:
+            修复后的网格（尽可能封闭）
+        """
+        if mesh.is_watertight():
+            self.log("  ✓ 网格已封闭")
+            return mesh
+
+        self.log("  ⚠️ 网格未封闭，执行修复...")
+
+        points = np.asarray(cloud.points)
+        ground_z = self._get_ground_z(points)
+
+        # 策略1：填充小孔洞
+        self.log("    尝试填充孔洞...")
+        initial_triangles = len(mesh.triangles)
+
+        # 细分可以帮助填充小孔洞
+        if initial_triangles < 10000:
+            mesh = mesh.subdivide_midpoint(number_of_iterations=1)
+            self.log(f"    网格细分: {initial_triangles} → {len(mesh.triangles)} 三角面")
+
+        # Laplacian平滑
+        mesh = mesh.filter_smooth_laplacian(number_of_iterations=5, lambda_filter=0.5)
+
+        # 清理
+        mesh.remove_degenerate_triangles()
+        mesh.remove_duplicated_triangles()
+        mesh.remove_duplicated_vertices()
+        mesh.remove_non_manifold_edges()
+
+        # 检查是否封闭
+        if mesh.is_watertight():
+            self.log("    ✓ 孔洞填充成功，网格已封闭")
+            return mesh
+
+        # 策略2：重新添加地面封底（更激进）
+        self.log("    重新添加地面封底...")
+        mesh = self._add_ground_base_enhanced(mesh, points, ground_z)
+
+        # 再次清理
+        mesh.remove_degenerate_triangles()
+        mesh.remove_duplicated_triangles()
+        mesh.remove_duplicated_vertices()
+
+        # 最终检查
+        if mesh.is_watertight():
+            self.log("    ✓ 地面封底成功，网格已封闭")
+        else:
+            self.log("    ⚠️ 网格仍未完全封闭（保留原算法结果）")
 
         return mesh
