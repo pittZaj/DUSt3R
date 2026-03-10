@@ -1,0 +1,29 @@
+# TRELLIS.2 Model Files (too large for git)
+TRELLIS.2-4B/
+RMBG-2.0/
+dinov3-vitl16-pretrain-lvd1689m/
+TRELLIS-image-large/
+
+# Model weights
+*.pth
+*.safetensors
+*.bin
+*.onnx
+
+# Output directories
+coal_pile_output_*/
+output_*/
+ply_analysis_output/
+
+# Logs
+*.log
+__pycache__/
+*.pyc
+
+# Temporary files
+test/
+.claude/
+
+# Large data files
+*.glb
+*.ply
